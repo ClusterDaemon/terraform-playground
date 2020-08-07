@@ -92,6 +92,7 @@ module "vpc" {
   }
 }
 
+
 module "eks" {
   source  = "terraform-aws-modules/eks/aws"
   version = "~> 12.0"
@@ -120,6 +121,7 @@ module "eks" {
 
 }
 
+# You'll need to put something here for ingress. Some restricted CIDR should be able to access whatever port(s) that application(s) listen on.
 resource "aws_security_group" "workers" {
   name = var.name
   vpc_id = module.vpc.vpc_id
@@ -127,10 +129,19 @@ resource "aws_security_group" "workers" {
   ingress {}
 }
 
-resource "helm_release" "tyk_ingress" {
+
+resource "null_resource" "k8s_ready" {
+  count = var.create_resources == true ? 1 : 0
+
+  triggers = {
+    ready = var.dependency_string
+  }
+}
+
+resource "helm_release" "tyk_pro" {
   name = var.name
-  chart = "tyk-ingress"
-  namespace = "tyk-ingress"
+  chart = "tyk-pro"
+  namespace = "tyk-pro"
   create_namespace = true
 
   values = [ <<EOF
@@ -385,3 +396,47 @@ resource "helm_release" "tyk_ingress" {
     EOF
   ]
 }
+
+resource "null_resource" "ingress_ready" {
+  provisioner "local-exec" {
+    command = "sleep 120"
+  }
+  depends_on = [ helm_release.tyk_pro ]
+}
+
+locals {
+  ingress_service_name = "${ var.name }-tyk-pro"
+  ingress_lb_fqdn = data.kubernetes_service.tyk_pro.load_balancer_ingress.0.hostname
+}
+
+# Obtain data about the ingress controller unified datapath service object using predefined service name.
+data "kubernetes_service" "tyk_pro" {
+  metadata {
+    name = local.ingress_service_name
+  }
+
+  depends_on = [ helm_release.ingress_ready ]
+}
+
+data "aws_lb" "tyk_pro" {
+  name = substr(data.kubernetes_service.tyk_pro.load_balancer_ingress.0.hostname, 0, 32)
+}
+
+resource "aws_route53_zone" "this" {
+  name = "cooljazzz.com"
+}
+
+resource "aws_route53_record" "this" {
+  count = var.app_hostnames
+
+  zone_id = aws_route53_zone.this.zone_id
+  name = var.app_hostnames[count.index]
+  type = "A"
+
+  alias {
+    name = local.ingress_lb_fqdn
+    zone_id = data.aws_lb.tyk_pro.zone_id
+    evaluate_target_health = false
+  }
+}
+
